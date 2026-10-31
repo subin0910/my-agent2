@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain.agents import create_agent
 from langchain_core.tools import tool
+from datetime import timedelta
+import pandas as pd
 
 # 1. 환경 변수 불러오기
 load_dotenv()
@@ -98,6 +100,113 @@ def get_exchange_rate(
         return f"환율 데이터 처리에 실패했습니다: {str(e)}"
 
 
+# ==============================================
+# 기간별 환율 조회 (API 데이터 캐싱)
+# ==============================================
+@st.cache_data(ttl=3600)
+def fetch_rate_history(base, target, days=30):
+    base = base.upper().strip()
+    target = target.upper().strip()
+
+    if base == target:
+        raise ValueError("서로 다른 두 통화를 선택하세요.")
+
+    if days not in (7, 30, 90, 180, 365):
+        raise ValueError("지원하지 않는 조회 기간입니다.")
+
+    end_date = date.today()
+    start_date = end_date - timedelta(days=days)
+
+    response = requests.get(
+        f"{API_URL}/rates",
+        params={
+            "base": base,
+            "quotes": target,
+            "from": start_date.isoformat(),
+            "to": end_date.isoformat()
+        },
+        timeout=15
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    if not isinstance(data, list) or not data:
+        raise ValueError("조회 가능한 환율 데이터가 없습니다.")
+
+    df = pd.DataFrame(data)
+
+    df["date"] = pd.to_datetime(df["date"])
+    df["rate"] = pd.to_numeric(df["rate"])
+
+    df = (
+        df.sort_values("date")
+        .drop_duplicates(subset=["date"], keep="last")
+        .set_index("date")
+    )
+
+    return df[["rate"]]
+
+
+# ==============================================
+# AI가 호출하는 기간별 환율 분석 Tool
+# ==============================================
+@tool
+def analyze_exchange_trend(
+    base: str = "USD",
+    target: str = "KRW",
+    days: int = 30
+) -> str:
+    """
+    특정 기간의 환율 추이를 분석한다.
+
+    Args:
+        base: 기준 통화 코드 (예: USD)
+        target: 대상 통화 코드 (예: KRW)
+        days: 분석 기간. 7, 30, 90, 180, 365 중 선택.
+    """
+    try:
+        df = fetch_rate_history(base, target, days)
+
+        first = float(df["rate"].iloc[0])
+        last = float(df["rate"].iloc[-1])
+
+        high = float(df["rate"].max())
+        low = float(df["rate"].min())
+        avg = float(df["rate"].mean())
+
+        change = (last - first) / first * 100
+
+        high_date = df["rate"].idxmax().date()
+        low_date = df["rate"].idxmin().date()
+
+        return f"""
+환율 추이 분석 결과
+
+통화: {base.upper()} → {target.upper()}
+요청 기간: 최근 {days}일
+실제 데이터 시작일: {df.index[0].date()}
+실제 데이터 종료일: {df.index[-1].date()}
+관측 데이터 수: {len(df)}개
+
+시작 환율: {first:,.4f}
+마지막 환율: {last:,.4f}
+최고 환율: {high:,.4f} ({high_date})
+최저 환율: {low:,.4f} ({low_date})
+평균 환율: {avg:,.4f}
+기간 변동률: {change:+.2f}%
+
+주의:
+- 위 변동률은 첫 관측일 대비 마지막 관측일 변화율임.
+- 환율은 일별 기준 환율이며 거래 시세가 아님.
+- 향후 환율의 상승이나 하락을 보장하지 않음.
+"""
+
+    except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+        return f"환율 추이 분석에 실패했습니다: {e}"
+
+
 # 6. AI 모델 및 Agent 생성
 @st.cache_resource
 def create_exchange_agent():
@@ -105,7 +214,7 @@ def create_exchange_agent():
 
     agent = create_agent(
         model,
-        tools=[get_exchange_rate],
+        tools=[get_exchange_rate, analyze_exchange_trend],
         system_prompt="""
 당신은 친절하고 정확한 환율 조회 AI 챗봇입니다.
 
@@ -127,6 +236,15 @@ def create_exchange_agent():
 9. 환율 기준일과 수수료 미포함 사실을 안내하세요.
 10. Frankfurter 환율은 일별 기준 환율이므로
     초 단위 실시간 거래 시세라고 설명하지 마세요.
+11. 사용자가 최근 N일, 최근 한 달, 환율 추이,
+    상승률, 하락률, 최고 환율, 최저 환율 등을 질문하면
+    analyze_exchange_trend Tool을 사용하세요.
+12. '최근 한 달'은 기본적으로 30일로 해석하세요.
+13. Tool에서 계산한 값을 그대로 사용하고,
+    실제 데이터에 없는 값은 만들어내지 마세요.
+14. 과거 환율 변화와 미래 환율 전망을 구분하세요.
+15. 과거 환율이 상승했다고 해서 앞으로도
+    상승할 것이라고 단정하지 마세요.
 """
     )
 
@@ -328,31 +446,60 @@ st.markdown("""
 st.divider()
 
 
-# ==================================================
-# 13. 주요 통화 카드
-# ==================================================
-st.subheader("🌍 주요 통화 살펴보기")
 
-col1, col2, col3 = st.columns(3)
+# ==============================================
+# 13. 실시간 조회형 주요 환율 카드
+# ==============================================
+st.subheader("🌍 주요 환율 현황")
 
-currency_cards = [
-    ("🇺🇸 미국 달러", "USD / KRW", "미국 달러 → 한국 원"),
-    ("🇯🇵 일본 엔", "JPY / KRW", "일본 엔 → 한국 원"),
-    ("🇪🇺 유로", "EUR / KRW", "유로 → 한국 원")
+pairs = [
+    ("🇺🇸 미국 달러", "USD"),
+    ("🇯🇵 일본 엔", "JPY"),
+    ("🇪🇺 유로", "EUR")
 ]
 
-for col, (label, title, desc) in zip(
-    [col1, col2, col3],
-    currency_cards
-):
+cols = st.columns(3)
+
+for col, (label, currency) in zip(cols, pairs):
     with col:
-        st.markdown(f"""
-        <div class="currency-card">
-            <div class="currency-label">{label}</div>
-            <div class="currency-title">{title}</div>
-            <div class="currency-desc">{desc}</div>
-        </div>
-        """, unsafe_allow_html=True)
+        try:
+            history = fetch_rate_history(
+                currency, "KRW", days=7
+            )
+
+            latest = float(history["rate"].iloc[-1])
+            latest_date = history.index[-1].date()
+
+            if len(history) >= 2:
+                previous = float(history["rate"].iloc[-2])
+                change_pct = (
+                    (latest - previous) / previous * 100
+                )
+                delta_text = f"{change_pct:+.2f}%"
+                delta_desc = "직전 관측일 대비"
+            else:
+                delta_text = None
+                delta_desc = ""
+
+            st.metric(
+                label=f"{label} ({currency}/KRW)",
+                value=f"₩ {latest:,.2f}",
+                delta=delta_text,
+                delta_color="normal",
+                help=delta_desc
+            )
+
+            st.caption(f"기준일: {latest_date}")
+
+        except (requests.RequestException, ValueError, KeyError) as e:
+            st.warning(f"{currency} 환율 조회 실패")
+            st.caption(str(e))
+
+st.caption(
+    "환율은 기준 통화 1단위당 원화 금액입니다. "
+    "변동률은 직전 관측일 대비입니다."
+)
+
 
 
 # ==================================================
@@ -387,6 +534,90 @@ with q3:
     )
 
 st.divider()
+
+
+
+# ==============================================
+# 환율 추이 시각화
+# ==============================================
+st.divider()
+st.subheader("📈 환율 추이 분석")
+
+st.caption(
+    "관심 있는 통화와 기간을 선택하면 "
+    "실제 환율 데이터를 시각화합니다."
+)
+
+chart_col1, chart_col2 = st.columns(2)
+
+with chart_col1:
+    chart_currency = st.selectbox(
+        "분석할 통화",
+        ["USD", "JPY", "EUR", "CNY", "GBP"],
+        format_func=lambda x: {
+            "USD": "🇺🇸 미국 달러",
+            "JPY": "🇯🇵 일본 엔",
+            "EUR": "🇪🇺 유로",
+            "CNY": "🇨🇳 중국 위안",
+            "GBP": "🇬🇧 영국 파운드"
+        }[x]
+    )
+
+with chart_col2:
+    chart_period = st.selectbox(
+        "조회 기간",
+        [7, 30, 90, 180, 365],
+        index=1,
+        format_func=lambda x: f"최근 {x}일"
+    )
+
+try:
+    chart_data = fetch_rate_history(
+        chart_currency,
+        "KRW",
+        chart_period
+    )
+
+    # 환율 그래프
+    st.line_chart(
+        chart_data,
+        y="rate",
+        x_label="날짜",
+        y_label=f"{chart_currency}/KRW",
+        height=340
+    )
+
+    # 통계 요약
+    latest_rate = chart_data["rate"].iloc[-1]
+    avg_rate = chart_data["rate"].mean()
+    highest_rate = chart_data["rate"].max()
+    lowest_rate = chart_data["rate"].min()
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric("최근 환율", f"{latest_rate:,.2f}")
+    c2.metric("평균 환율", f"{avg_rate:,.2f}")
+    c3.metric("최고 환율", f"{highest_rate:,.2f}")
+    c4.metric("최저 환율", f"{lowest_rate:,.2f}")
+
+    st.caption(
+        f"데이터 기간: "
+        f"{chart_data.index[0].date()} ~ "
+        f"{chart_data.index[-1].date()}"
+    )
+
+    # 데이터 내려받기
+    csv_data = chart_data.to_csv().encode("utf-8-sig")
+
+    st.download_button(
+        label="📥 환율 데이터 CSV 다운로드",
+        data=csv_data,
+        file_name=f"{chart_currency}_KRW_{chart_period}days.csv",
+        mime="text/csv"
+    )
+
+except (requests.RequestException, ValueError, KeyError) as e:
+    st.error(f"차트 데이터를 가져오지 못했습니다: {e}")
 
 
 # ==================================================
