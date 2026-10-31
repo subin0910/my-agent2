@@ -271,7 +271,7 @@ st.markdown("""
 <style>
     .block-container {
         max-width: 1100px;
-        padding-top: 2rem;
+        padding-top: 3rem;
         padding-bottom: 3rem;
     }
 
@@ -285,7 +285,9 @@ st.markdown("""
         font-weight: 800;
         letter-spacing: -1.5px;
         margin-bottom: 8px;
-        line-height: 1.25;
+        line-height: 1.35;
+        padding-top: 8px;
+        overflow: visible;
     }
 
     .hero-accent {
